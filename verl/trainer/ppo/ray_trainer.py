@@ -144,15 +144,33 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     kld = core_algos.kl_penalty(
         data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
     )  # (batch_size, response_length)
-    kld = kld * response_mask
+    # 每个token位置的KL散度值 (batch_size, response_length)
+    kld = kld * response_mask # 这里是逐个位置相乘（不是矩阵乘），只保留响应部分的KL散度
+    # 这里的beta实际上是KL散度惩罚系数，它是由自适应KL控制器动态调整的，不是固定的超参数。
     beta = kl_ctrl.value
 
+    """
+    token_level_scores 和 token_level_rewards 的区别
+    token_level_scores（原始奖励）
+        来自奖励模型的原始质量评估
+        可能是序列级奖励广播到token级别
+        只反映生成文本的质量
+    token_level_rewards（最终奖励）
+        经过KL惩罚调整后的奖励
+        包含了对策略偏离的惩罚项
+        既考虑质量又考虑策略稳定性
+    """
     token_level_rewards = token_level_scores - beta * kld
 
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
+    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence  # current_kl: (batch_size,) - 每个样本的平均KL散度
+    current_kl = torch.mean(current_kl, dim=0).item()  # 整个批次的平均KL散度
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
+    """
+    根据当前KL散度调整KL惩罚系数(beta)
+    如果当前KL散度高于目标值，增加惩罚系数
+    如果当前KL散度低于目标值，减少惩罚系数
+    """
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
     data.batch["token_level_rewards"] = token_level_rewards
 
@@ -1143,6 +1161,11 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     # recompute old_log_probs
+                    # 这里的old_log_probs实际上是当前策略的log_probs
+                    # 旧策略的log_probs是在rollout阶段缓存下来的
+                    # 这里算出的形状的 (batch_size, response_length)
+                    # 也就是说每个token有一个对数概率,
+                    # 每个样本的每个token都会参与prob_diff的计算，但最终输出的是整个batch范围内的统计指标，而不是为每个样本单独计算一个差异值。
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
@@ -1154,12 +1177,14 @@ class RayPPOTrainer:
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
+                        # 计算重要性采样，重要性采样用来修正同异略差异
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
                             from verl.utils.debug.metrics import calculate_debug_metrics
 
                             metrics.update(calculate_debug_metrics(batch))
 
+                    # 使用参考模型，参考模型用来计算KL惩罚，防止离SFT后的模型跑的太偏，造成奖励杀手
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
@@ -1170,6 +1195,8 @@ class RayPPOTrainer:
                             batch = batch.union(ref_log_prob)
 
                     # compute values
+                    # 如果是PPO的话，计算critic网络，让他能准确估计value函数
+                    # value函数是用来算GAE优势函数的，然后才能优化actor网络
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self.critic_wg.compute_values(batch)
@@ -1180,12 +1207,32 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        # 这里的token级别奖励，做个说明
+                        # 一般RLHF是直接输出序列级奖励，也就是一个prompt+response算一个奖励值出来
+                        # 某些奖励模型直接输出每个token的奖励值
+                        # 或者将序列奖励复制到每个响应token位置
+                        """
+                        假设我们有一个prompt "写一首关于春天的诗"和response "春风吹绿江南岸"：
+
+                        序列级奖励：整体质量评分为8.5
+                        Token级奖励：
+                        位置: [P,P,P,P,P,P,P,春,风,吹,绿,江,南,岸]
+                        奖励: [0,0,0,0,0,0,0,2.0,1.5,2.0,1.5,1.0,1.0,1.0]
+                        其中P表示prompt部分，奖励为0；每个响应token根据其贡献获得相应奖励。
+                        这样做的好处是可以：
+
+                        更细粒度地更新策略
+                        在优势计算时更好地考虑局部效果
+                        支持更复杂的奖励塑造策略
+                        """
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
+                        # 如果启用KL散度惩罚（在奖励中加入KL惩罚项），则调用apply_kl_penalty函数
+                        # 否则直接将奖励分数作为最终奖励使用
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
@@ -1202,10 +1249,19 @@ class RayPPOTrainer:
                         metrics.update(is_metrics)
 
                         # compute advantages, executed on the driver process
+                        """
+                        norm_adv_by_std_in_grpo 控制是否使用标准差对优势函数进行归一化: advantages = (advantages - mean) / std
+                        GRPO算法中特别需要这个参数，因为：
+                            1. GRPO使用组级别的奖励计算
+                            2. 不同组之间的优势值可能有较大差异
+                            3. 标准化有助于平衡不同组之间的影响
+                        """
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
-
+                        
+                        # advantages.shape = (batch_size, response_length)
+                        # 每个元素 advantages[i, j] 表示第 i 个样本中第 j 个响应token的优势值。
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
