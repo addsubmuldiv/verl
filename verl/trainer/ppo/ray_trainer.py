@@ -250,6 +250,7 @@ def compute_advantage(
         grpo_calculation_mask = data.batch["response_mask"]
 
         # Call compute_grpo_outcome_advantage with parameters matching its definition
+        # GRPO 优势计算， 公式: 优势 = (样本分数 - 组内均值) / (组内标准差 + epsilon)
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
