@@ -1274,6 +1274,7 @@ class RayPPOTrainer:
                         )
 
                     # update critic
+                    # 如果有，更新critic网络
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self.critic_wg.update_critic(batch)
@@ -1283,12 +1284,22 @@ class RayPPOTrainer:
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        # 这里是更新actor的
+                        """
+                        Critic Warmup是一种训练策略，特别是在PPO（Proximal Policy Optimization）等强化学习算法中常用：
+
+                        初始阶段：只训练Critic（价值网络），让Critic先学习如何准确评估状态/动作的价值
+                        后期阶段：当Critic有一定准确性后，再开始训练Actor（策略网络）
+
+                        先让Critic获得较好的估值能力，有助于Actor后续更有效地优化策略
+                        """
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
+                    # 记录rollout阶段的数据，方便打桩调试
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
@@ -1307,6 +1318,7 @@ class RayPPOTrainer:
                     metrics.update(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+                    # 云环境训练的时候用，就是为了快到期的时候保存当前模型，其他时候没用
                 esi_close_to_expiration = should_save_ckpt_esi(
                     max_steps_duration=self.max_steps_duration,
                     redundant_time=self.config.trainer.esi_redundant_time,
@@ -1318,6 +1330,7 @@ class RayPPOTrainer:
                 # 2. It's the last training step.
                 # 3. The current step number is a multiple of the save frequency.
                 # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+                    # 根据这几个条件判断要不要保存当前模型
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
                 ):
@@ -1339,7 +1352,7 @@ class RayPPOTrainer:
                     )
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile
-
+                # 记录这个step的时间
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
@@ -1383,6 +1396,18 @@ class RayPPOTrainer:
 
                 # this is experimental and may be changed/removed in the future
                 # in favor of a general-purpose data buffer pool
+                """
+                作用： 这个机制允许数据集对象在每个训练批次结束后执行一些自定义操作，例如：
+
+                更新数据集内部状态
+                根据训练进度调整数据采样策略
+                记录批次级别的统计数据
+                清理或更新数据缓冲区
+                实现课程学习（curriculum learning）等动态数据调整策略
+                这是一种扩展机制，让数据集可以根据训练过程中的反馈动态调整自身行为，
+                而不仅仅是一个静态的数据提供者。
+                正如注释所说，这是一项实验性功能，未来可能会用更通用的数据缓冲池机制来替代。
+                """
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)

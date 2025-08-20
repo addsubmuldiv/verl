@@ -87,22 +87,44 @@ def get_master_addr_port() -> tuple[str, str]:
         port = sock.getsockname()[1]
     return addr, str(port)
 
-
+# RayResourcePool 是一个用于管理 Ray 分布式计算资源的类，主要功能是为分布式训练创建和管理 GPU 资源池。
 class RayResourcePool(ResourcePool):
+    """
+    # 从代码结构推测，可能有如下资源池：
+
+    # Actor资源池 - 用于策略网络
+    actor_pool = RayResourcePool(
+        process_on_nodes=[8, 8],     # 2节点，每节点8进程
+        max_colocate_count=1,        # 只运行Actor WorkerGroup
+    )
+
+    # Critic资源池 - 用于价值网络  
+    critic_pool = RayResourcePool(
+        process_on_nodes=[4, 4],     # 2节点，每节点4进程
+        max_colocate_count=1,        # 只运行Critic WorkerGroup
+    )
+
+    # Rollout资源池 - 用于数据收集
+    rollout_pool = RayResourcePool(
+        process_on_nodes=[16, 16],   # 2节点，每节点16进程
+        max_colocate_count=4,        # 可以运行多个Rollout WorkerGroups
+    )
+    
+    """
     def __init__(
         self,
-        process_on_nodes: Optional[list[int]] = None,
-        use_gpu: bool = True,
-        name_prefix: str = None,
-        max_colocate_count: int = 10,
-        detached=False,
-        accelerator_type: Optional[str] = None,
+        process_on_nodes: Optional[list[int]] = None,   # 每个节点上的进程数列表
+        use_gpu: bool = True,                           # 是否使用 GPU
+        name_prefix: str = None,                        # 资源池名称前缀
+        max_colocate_count: int = 10,                   # 每个 RayResourcePool 中 WorkerGroups 的数量
+        detached=False,                                 # 是否分离资源池
+        accelerator_type: Optional[str] = None,         # 加速器类型 
     ) -> None:
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
         # print(f"in RayProcessDispatchConfiguration: name_prefix = {name_prefix}")
         self.name_prefix = get_random_string(length=6) if name_prefix is None else name_prefix
-        self.pgs = None
+        self.pgs = None                                 # 记录当前资源池的 Placement Groups
         self.detached = detached
         self.accelerator_type = accelerator_type
 
@@ -118,12 +140,14 @@ class RayResourcePool(ResourcePool):
             device_name = "NPU"
         elif device_name == "cuda":
             device_name = "GPU"
-
-        bundle = {"CPU": self.max_colocate_count}
+        # max_colocate_count 定义了容量上限（最多支持多少个 WorkerGroups）
+        # CPU 资源的分配则是基于这个上限来预留足够的资源（至少需要这么多 CPU）
+        bundle = {"CPU": self.max_colocate_count}       # 每个资源包至少需要 max_colocate_count 个 CPU 核心。
         if self.use_gpu:
-            bundle[device_name] = 1
+            bundle[device_name] = 1                     # 如果 use_gpu 为 True，则为这个资源包添加 1 个 GPU (或 NPU) 的需求。
             if self.accelerator_type is not None:
-                bundle[self.accelerator_type] = 1e-4
+                bundle[self.accelerator_type] = 1e-4    # 这是一个高级用法，用于请求特定类型的加速器（例如 'V100'），
+                                                        # 1e-4 是一个技巧，表示只需要这个标签存在，而不真正消耗资源。
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None
