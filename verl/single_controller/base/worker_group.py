@@ -41,8 +41,8 @@ class ResourcePool:
         """
         if process_on_nodes is None:
             process_on_nodes = []
-        self._store = process_on_nodes
-        self.max_colocate_count = max_colocate_count
+        self._store = process_on_nodes  # 存储每个节点上的进程数量列表
+        self.max_colocate_count = max_colocate_count    # 每个资源池中最多可以同时放置的 WorkerGroups 数量,Ray placement groups 会根据这个数值预留足够的CPU资源
         self.n_gpus_per_node = n_gpus_per_node  # this is left for future huawei GPU that contains 16 GPUs per node
 
     def add_node(self, process_count):
@@ -50,7 +50,7 @@ class ResourcePool:
 
     @property
     def world_size(self):
-        """Total number of processes across all nodes in the pool."""
+        """Total number of processes across all nodes in the pool. 分布式训练中的全局进程数量"""
         return sum(self._store)
 
     def __call__(self) -> Any:
@@ -61,14 +61,20 @@ class ResourcePool:
         return self._store
 
     def local_world_size_list(self) -> list[int]:
-        """Returns a flat list where each process has its local world size."""
+        """Returns a flat list where each process has its local world size.
+            # 输入：[8, 4, 2]
+            # 输出：[8,8,8,8,8,8,8,8, 4,4,4,4, 2,2]
+        """
         nested_local_world_size_list = [
             [local_world_size for _ in range(local_world_size)] for local_world_size in self._store
         ]
         return [item for row in nested_local_world_size_list for item in row]
 
     def local_rank_list(self) -> list[int]:
-        """Returns a flat list of local ranks for all processes across all nodes."""
+        """Returns a flat list of local ranks for all processes across all nodes.
+            # 输入：[8, 4, 2]
+            # 输出：[0,1,2,3,4,5,6,7, 0,1,2,3, 0,1]
+        """
         nested_local_rank_list = [[i for i in range(local_world_size)] for local_world_size in self._store]
         return [item for row in nested_local_rank_list for item in row]
 
