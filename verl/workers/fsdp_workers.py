@@ -13,6 +13,21 @@
 # limitations under the License.
 """
 The main entry point to run the PPO algorithm
+
+
+文件整体作用
+
+提供基于 PyTorch FSDP (含 fsdp / fsdp2) 的多角色训练 / 
+推理 Worker 实现：策略模型(Actor / Rollout / Ref 组合)、价值模型(Critic)、奖励模型(RM)、
+以及异步推理变体(AsyncActorRolloutRefWorker)。
+
+
+这些类本身不直接写 Ray 代码；它们是被 RayWorkerGroup 通过 ray.remote 包装后运行在各个进程里的“业务逻辑主体”。
+
+
+分布式底座（rank、world_size、MASTER_ADDR 等）与 Ray 资源调度在别处完成：
+RayClassWithInitArgs + RayWorkerGroup + Worker 基类。这里专注：模型/优化器构建、FSDP 装配、
+LoRA/激活卸载/混合精度、Ulysses (sequence parallel) 与多种 rollout 后端(vLLM / HF / sglang)。
 """
 
 import datetime
