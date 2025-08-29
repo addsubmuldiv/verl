@@ -13,6 +13,19 @@
 # limitations under the License.
 """
 the class for Worker
+
+verl没有使用Ray原生的ai训练框架，如Ray Train或Ray AIR（这里面就有rank等ai方面东西）
+所以这里worker都是完全自己定义的一套东西，这导致
+rank等ai方面的概念在原生ray里面是没有的，只有task和actor的概念
+所以这些都是verl自己定义
+
+verl中仅使用了Ray的核心分布式计算能力
+
+为什么选择自定义而不是使用Ray原生框架：
+1. 更精确的控制：强化学习训练中可能需要更复杂的Worker间协调机制
+2. 灵活性：可以根据具体需求定制分布式策略
+3. 性能优化：针对强化学习的特定需求进行优化
+4. 集成现有代码：更容易将现有的强化学习代码迁移到分布式环境
 """
 
 import os
@@ -100,6 +113,7 @@ class Worker(WorkerHelper):
         """
         assert isinstance(rank, int), f"rank must be int, instead of {type(rank)}"
 
+        # worker初始化，rank = 0 的 要做一些额外的初始化工作，获取到ip和端口，后面要给其他的rank也配置同样的环境变量(RayWorkerGroup)
         if rank == 0:
             master_addr, master_port = self.get_availale_master_addr_port()
             rank_zero_info = {
@@ -109,7 +123,8 @@ class Worker(WorkerHelper):
 
             if os.getenv("WG_BACKEND", None) == "ray":
                 from verl.single_controller.base.register_center.ray import create_worker_group_register_center
-
+                # 这里创建注册中心，用于同步各个worker之间的信息
+                # 单机的时候就是rank 0创建注册中心，把网络信息放进去，然后其他的rank拉取赋值给自己的worker
                 self.register_center = create_worker_group_register_center(
                     name=register_center_name, info=rank_zero_info
                 )
@@ -119,6 +134,7 @@ class Worker(WorkerHelper):
             self.register_center = ray.get_actor(register_center_name)
 
         # set worker info for node affinity scheduling
+        # 将当前worker的rank和所在节点ID注册到注册中心
         ray.get(self.register_center.set_worker_info.remote(rank, ray.get_runtime_context().get_node_id()))
 
     @classmethod
