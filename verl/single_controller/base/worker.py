@@ -13,6 +13,19 @@
 # limitations under the License.
 """
 the class for Worker
+
+verl没有使用Ray原生的ai训练框架，如Ray Train或Ray AIR（这里面就有rank等ai方面东西）
+所以这里worker都是完全自己定义的一套东西，这导致
+rank等ai方面的概念在原生ray里面是没有的，只有task和actor的概念
+所以这些都是verl自己定义
+
+verl中仅使用了Ray的核心分布式计算能力
+
+为什么选择自定义而不是使用Ray原生框架：
+1. 更精确的控制：强化学习训练中可能需要更复杂的Worker间协调机制
+2. 灵活性：可以根据具体需求定制分布式策略
+3. 性能优化：针对强化学习的特定需求进行优化
+4. 集成现有代码：更容易将现有的强化学习代码迁移到分布式环境
 """
 
 import os

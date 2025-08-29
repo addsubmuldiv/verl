@@ -128,6 +128,12 @@ class RayResourcePool(ResourcePool):
         self.detached = detached
         self.accelerator_type = accelerator_type
 
+    """
+    strategy
+    PACK：尽可能将所有资源打包到同一节点（适合通信密集型任务）
+    SPREAD：尽可能将资源分布到不同节点（适合计算密集型且需要容错的任务）
+    STRICT_PACK：严格要求所有资源在同一节点，否则创建失败
+    """
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
             return self.pgs
@@ -136,6 +142,7 @@ class RayResourcePool(ResourcePool):
             name if name else f"{self.name_prefix}verl_group_{'_'.join([str(count) for count in self._store])}:"
         )
         # print(f"pg_name_prefix = {pg_name_prefix}")
+        # 设置每个placement_group所需资源
         if device_name == "npu":
             device_name = "NPU"
         elif device_name == "cuda":
@@ -148,10 +155,12 @@ class RayResourcePool(ResourcePool):
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4    # 这是一个高级用法，用于请求特定类型的加速器（例如 'V100'），
                                                         # 1e-4 是一个技巧，表示只需要这个标签存在，而不真正消耗资源。
-        pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
+        pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store] # 这里_store就是process_on_node，就是每节点进程数
 
         lifetime = "detached" if self.detached else None
 
+        # 一“节点”对应一个 placement group，节点上的“每个进程”对应 placement group 里的一个 bundle
+        # 每次 placement_group(...) 创建的是“这个节点的整组进程的集合”，而不是单进程。
         pgs = [
             placement_group(bundles=bundles, strategy=strategy, name=pg_name_prefix + str(idx), lifetime=lifetime)
             for idx, bundles in enumerate(pg_scheme)
@@ -256,6 +265,13 @@ class RayClassWithInitArgs(ClassWithInitArgs):
             A Ray actor handle with the configured options
         """
         if sharing_with is not None:
+            """
+            这段代码提供“基于已有 actor 的同机 + GPU 可见设备复用”通道；
+            sharing_with 是一个已有 Ray actor 句柄（常规 Worker），
+            只有为非 None 时才绕过 PG bundle 调度，直接用 NodeAffinity 固定节点并复制其 CUDA_VISIBLE_DEVICES
+
+            也就是说后来建的actor和已有的共享GPU
+            """
             target_node_id = ray.get(sharing_with.get_node_id.remote())
             visible_devices = ray.get(sharing_with.get_cuda_visible_devices.remote())
             options = {"scheduling_strategy": NodeAffinitySchedulingStrategy(node_id=target_node_id, soft=False)}
@@ -289,6 +305,8 @@ class RayWorkerGroup(WorkerGroup):
     This class extends WorkerGroup to provide Ray-specific functionality for
     creating and managing groups of Ray actors with specific resource requirements
     and scheduling strategies.
+
+    消费一个 RayResourcePool（调用 get_placement_groups），按照 PG→bundle 顺序实际创建 Ray Actors，形成逻辑上的“world”
     """
 
     def __init__(
@@ -401,10 +419,11 @@ class RayWorkerGroup(WorkerGroup):
         world_size = resource_pool.world_size
         self._world_size = world_size
         # cia.add_kwarg("_world_size", world_size)
-        num_gpus = 1 / resource_pool.max_colocate_count
+        # 一个 bundle（1 GPU）可被分数化共享给多个 actor（逻辑同 GPU overlay），并配合 bundle 里 CPU=max_colocate_count 保障并发上限
+        num_gpus = 1 / resource_pool.max_colocate_count  # 配置一个 bundle 里面的多个进程/actor共享GPU
 
         rank = -1
-        local_world_size = resource_pool.store[0]
+        local_world_size = resource_pool.store[0]  # 设计假设：所有节点的bundle数相同（“同构”配置）
         for pg_idx, pg in enumerate(sort_placement_group_by_node_ip(pgs)):
             assert local_world_size <= pg.bundle_count, f"when generating for {self.name_prefix}, for the "
             if pg_idx == 0:
@@ -414,6 +433,7 @@ class RayWorkerGroup(WorkerGroup):
                 rank += 1
 
                 # we pass in environment variable at option so that Worker can use environment variable to set
+                # 给每个 bundle 配置环境变量，使用的卡、ip、world_size等
                 env_vars = {
                     "WORLD_SIZE": str(world_size),
                     "RANK": str(rank),
@@ -457,6 +477,24 @@ class RayWorkerGroup(WorkerGroup):
                     ray_cls_with_init.update_options({"lifetime": "detached"})
 
                 # create a worker
+                # worker : rank : bundle = 1 : 1 : 1（每创建一个 worker 占用该 PG 的一个 bundle，并赋一个全局 rank）
+                # 同一 bundle 理论上可以逐步再放进 (max_colocate_count - 1) 个额外 actor（来自同一或新的 WorkerGroup），直到总和=1
+                # 这个worker就是Ray里面的actor
+
+                """
+                GPU 分数化让“资源预留（整卡占坑）”与“实际声明占用（逻辑份额）”解耦，
+                从而在不改 PG 结构的情况下为轻量/多角色/并发采样场景提供灵活的共享与扩展能力；
+                你不需要时把 max_colocate_count 调回 1 即可回到标准一进程一 GPU。
+
+                为什么GPU要搞成一个分数(1  / max_colocate_count) ?
+                1. 有些角色轻（如 reward model、reference / ref model、critic、metrics/eval、数据预处理），单独吃不满 1 GPU。 
+                允许它们与主 actor/rollout 共享一块卡，提高利用率。
+                2. 采样（rollout）阶段利用率抖动大。可在同一物理 GPU 上并存多个 rollout worker，吞吐更平滑。
+                3. 同卡上放一个训练 rank + 一个评测/生成 rank，避免额外节点占用，降低延迟（便于 RLHF 或在线评估）。
+                4. 想独占：设 max_colocate_count=1 → num_gpus=1（等价全卡）。
+                5. 想多路并发：调大max_colocate_count即可，无需改上层调用。
+                6. bundle 里 CPU = max_colocate_count 是一个并发保护：即使多个小 actor 拼在一起也不会超 CPU。
+                """
                 worker = ray_cls_with_init(
                     placement_group=pg,
                     placement_group_bundle_idx=local_rank,
