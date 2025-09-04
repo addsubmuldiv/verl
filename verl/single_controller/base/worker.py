@@ -172,6 +172,8 @@ class Worker(WorkerHelper):
         Args:
             cuda_visible_devices (str, optional):
                 CUDA visible devices configuration. Defaults to None.
+
+        配置一下基本的环境信息，比如world_size，rank，local_world_size，local_rank，master_addr，master_port
         """
         # construct a meta from environment variable. Note that the import must be inside the class because
         # it is executed remotely

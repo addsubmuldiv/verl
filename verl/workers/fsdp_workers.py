@@ -110,8 +110,14 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
-
 def create_device_mesh(world_size, fsdp_size):
+    """
+    如果 fsdp_size < 0 或 fsdp_size >= world_size → 退化为一维 mesh_shape=(world_size,)，
+    命名 ["fsdp"]。此时只存在一个维度，后续等价 FULL_SHARD（全部进程共同组成一个 FSDP 维；没有再拆外层 DP）。
+
+    否则，创建二维 mesh_shape=(world_size // fsdp_size, fsdp_size)，命名 ["ddp", "fsdp"]。
+    第一维 ddp = world_size // fsdp_size：外层数据并行（或称 dp / replication）组数。  第二维 fsdp = fsdp_size：每个数据并行组内部再按 FSDP 分片。
+    """
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh(device_name, mesh_shape=(world_size,), mesh_dim_names=["fsdp"])
     else:
@@ -162,7 +168,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             torch.distributed.init_process_group(
-                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}", # 在cpu上跑gloo，在gpu上跑nccl
                 rank=rank,
                 world_size=world_size,
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
@@ -177,6 +183,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # build device mesh for Ulysses Sequence Parallel
         self.ulysses_device_mesh = None
         self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
+        # 开了序列并行，会自动带上数据并行切分
         dp = world_size // self.ulysses_sequence_parallel_size
         if self.ulysses_sequence_parallel_size > 1:
             self.ulysses_device_mesh = init_device_mesh(
@@ -248,6 +255,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # normalize config
         if self._is_actor:
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
+            # self.device_mesh.size() // self.ulysses_sequence_parallel_size 是有效设备数
             self.config.actor.ppo_mini_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             assert self.config.actor.ppo_mini_batch_size > 0, (
                 f"ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than 0 after "
