@@ -1179,6 +1179,8 @@ class RayPPOTrainer:
                         batch = batch.union(old_log_prob)
 
                         # 计算重要性采样，重要性采样用来修正同异略差异
+                        # 在RLHF和RLVR里面的PPO、GRPO，实际上就只有一个策略模型，
+                        # 和一个参考模型，然后这个策略模型就负责rollout，然后更新参数，然后用更新了参数的模型继续rollout、继续更新这样循环
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
                             from verl.utils.debug.metrics import calculate_debug_metrics
